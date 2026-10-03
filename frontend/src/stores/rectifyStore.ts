@@ -66,6 +66,7 @@ export const useRectifyStore = defineStore('rectify', () => {
       state: 'pending',
       reviewer: draft.reviewer.trim(),
       reviewedAt: null,
+      sourceItemId: draft.sourceItemId,
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     };
@@ -133,7 +134,7 @@ export const useRectifyStore = defineStore('rectify', () => {
         (row) => row.elevatorId === elevatorId && row.item === item.itemName && row.state === 'pending',
       );
       if (exists) continue;
-      await createRectify({ elevatorId, item: item.itemName, dueDate, reviewer });
+      await createRectify({ elevatorId, item: item.itemName, dueDate, reviewer, sourceItemId: item.id });
       created += 1;
     }
     return created;

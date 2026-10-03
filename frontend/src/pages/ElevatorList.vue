@@ -366,19 +366,29 @@ const rescueColumns: DataTableColumns<(typeof elevatorStore.rescues)[number]> = 
             <n-button size="tiny" text type="primary" @click.stop="detailElevatorId = item.id">
               查看档案详情
             </n-button>
-            <n-button
-              size="tiny"
-              text
-              type="primary"
-              @click.stop="
-                () => {
-                  elevatorStore.setActive(item.id);
-                  router.push(ROUTES.plans);
-                }
-              "
-            >
-              去生成计划
-            </n-button>
+            <n-space :size="2">
+              <n-button
+                size="tiny"
+                text
+                type="primary"
+                @click.stop="router.push(`${ROUTES.archives}?elevatorId=${item.id}`)"
+              >
+                封存
+              </n-button>
+              <n-button
+                size="tiny"
+                text
+                type="primary"
+                @click.stop="
+                  () => {
+                    elevatorStore.setActive(item.id);
+                    router.push(ROUTES.plans);
+                  }
+                "
+              >
+                去生成计划
+              </n-button>
+            </n-space>
           </n-space>
         </div>
       </div>

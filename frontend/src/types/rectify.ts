@@ -23,6 +23,8 @@ export interface Rectify extends Revisioned {
   reviewer: string;
   /** 复核时间 */
   reviewedAt: string | null;
+  /** 来源异常保养项 id（由异常项一键转整改时回填，封存据此关联） */
+  sourceItemId?: string;
   createdAt: string;
 }
 
@@ -32,6 +34,8 @@ export interface RectifyDraft {
   item: string;
   dueDate: string;
   reviewer: string;
+  /** 来源异常保养项 id（手工登记可不填） */
+  sourceItemId?: string;
 }
 
 /** 整改单视图：带电梯上下文与超期天数 */

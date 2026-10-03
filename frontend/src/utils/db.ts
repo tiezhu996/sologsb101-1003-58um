@@ -12,6 +12,21 @@ import type { CheckItem, CheckResult } from '../types/checkItem';
 import { itemsForCycle } from '../types/checkItem';
 import type { Rescue } from '../types/rescue';
 import type { Rectify } from '../types/rectify';
+import type { Archive } from '../types/archive';
+import type { PendingArchive } from '../types/archive';
+import type { ArchivePackage } from '../types/archive';
+import {
+  ARCHIVE_FORMAT_VERSION,
+  ARCHIVE_PACKAGE_KIND,
+  isArchivePackage,
+} from '../types/archive';
+import {
+  archiveDedupKey,
+  generateArchiveNo,
+  resolveSealing,
+  sameRow,
+  validateArchive,
+} from './archive';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { addDays, generatePlanDates, nextPlanDate } from './cycle';
 import { nowDateTime, rescueMinutes, todayDate } from './duration';
@@ -20,7 +35,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -30,6 +45,27 @@ export type PlanRow = Plan;
 export type CheckItemRow = CheckItem;
 export type RescueRow = Rescue;
 export type RectifyRow = Rectify;
+export type ArchiveRow = Archive;
+export type PendingArchiveRow = PendingArchive;
+
+/** 档案包导入任务：逐份档案推进，失败保留进度并重试 */
+export interface ArchiveImportJobRow extends Revisioned {
+  id: string;
+  /** 原始档案包（含尚未处理的全部档案，重试时无需重新选择文件） */
+  package: ArchivePackage;
+  /** 已成功落库的档案号 */
+  importedNos: string[];
+  /** 进入待处理区的档案号 */
+  stagedNos: string[];
+  /** 尚未处理的档案号 */
+  pendingNos: string[];
+  state: 'running' | 'done' | 'error';
+  /** 最近一次系统级错误（档案自身缺项 / 冲突写入 reasons，不算失败） */
+  lastError: string;
+  sourceFile: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 class ElevatorServiceDatabase extends Dexie {
   elevators!: Table<ElevatorRow, string>;
@@ -38,6 +74,12 @@ class ElevatorServiceDatabase extends Dexie {
   rescues!: Table<RescueRow, string>;
   rectifies!: Table<RectifyRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** 已封存独立档案（主键为档案号） */
+  archives!: Table<ArchiveRow, string>;
+  /** 待处理区：核对未过的档案包 */
+  archiveStaging!: Table<PendingArchiveRow, string>;
+  /** 档案包导入进度（失败后保留进度以便重试） */
+  archiveImportJobs!: Table<ArchiveImportJobRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -87,6 +129,44 @@ class ElevatorServiceDatabase extends Dexie {
           if (typeof row.remark !== 'string') row.remark = '';
           if (row.result === undefined) row.result = null;
         });
+      });
+
+    // v3：新增封存档案三表；整改单补 sourceItemId 来源异常项引用（旧数据按同电梯同项目名兜底回填）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies: 'id, elevatorId, state, dueDate, reviewer, sourceItemId',
+        settings: 'id',
+        archives: 'archiveNo, elevatorId, monthFrom, monthTo, sealedAt, [elevatorId+monthFrom+monthTo]',
+        archiveStaging: 'id, archiveNo, elevatorId, createdAt',
+        archiveImportJobs: 'id, state, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 旧数据先迁移补上来源档案项引用：异常 / 建议保养项与同电梯同项目名整改单建立关联
+        const plans = await tx.table('plans').toCollection().toArray();
+        const items = await tx.table('checkItems').toCollection().toArray();
+        const planElevator = new Map<string, string>();
+        for (const plan of plans as Array<Record<string, unknown>>) {
+          planElevator.set(String(plan.id), String(plan.elevatorId));
+        }
+        const abnormalItems = (items as Array<Record<string, unknown>>).filter(
+          (item) => item.result === 'abnormal' || item.result === 'advice',
+        );
+        await tx
+          .table('rectifies')
+          .toCollection()
+          .modify((rectify: Record<string, unknown>) => {
+            if (typeof rectify.sourceItemId === 'string') return;
+            const elevatorId = String(rectify.elevatorId);
+            const matched = abnormalItems.find((item) => {
+              const itemElevator = planElevator.get(String(item.planId));
+              return itemElevator === elevatorId && item.itemName === rectify.item;
+            });
+            if (matched) rectify.sourceItemId = String(matched.id);
+          });
       });
   }
 }
@@ -461,6 +541,304 @@ export async function removeRectify(id: string): Promise<void> {
   await db.rectifies.delete(id);
 }
 
+/* ============================ 封存档案 ============================ */
+
+export interface SealInput {
+  elevatorId: string;
+  monthFrom: string;
+  monthTo: string;
+  note?: string;
+}
+
+export async function listArchives(): Promise<ArchiveRow[]> {
+  const rows = await db.archives.toArray();
+  return rows.sort((a, b) => b.sealedAt.localeCompare(a.sealedAt));
+}
+
+export async function listArchivesByElevator(elevatorId: string): Promise<ArchiveRow[]> {
+  const rows = await db.archives.where('elevatorId').equals(elevatorId).toArray();
+  return rows.sort((a, b) => a.monthFrom.localeCompare(b.monthFrom));
+}
+
+async function occupiedArchiveNos(): Promise<string[]> {
+  return (await db.archives.toArray()).map((archive) => archive.archiveNo);
+}
+
+/**
+ * 封存：按电梯 + 结清月份把已签署计划、对应保养项及异常项转出的整改单
+ * 装成独立档案写入 archives 表；现行台账各表一律保留不删。
+ * 同电梯同结清月份区间已封存过则拒绝（两个标签页同时封存只保留一份）。
+ */
+export async function sealArchive(input: SealInput): Promise<ArchiveRow> {
+  const [elevator, plans, checkItems, rectifies] = await Promise.all([
+    db.elevators.get(input.elevatorId),
+    listPlansByElevator(input.elevatorId),
+    listCheckItems(),
+    listRectifies(),
+  ]);
+  if (!elevator) throw new Error('电梯不存在，无法封存');
+
+  const resolved = resolveSealing(
+    { elevatorId: input.elevatorId, monthFrom: input.monthFrom, monthTo: input.monthTo },
+    { elevator, plans, checkItems, rectifies },
+  );
+  if (!resolved.ok) {
+    throw new Error(`封存校验未通过：${resolved.errors.join('；')}`);
+  }
+
+  // 同电梯同结清月份区间去重；与既有封存区间交叉也拒绝，避免同一计划被装进两份档案
+  const existing = await listArchivesByElevator(input.elevatorId);
+  const duplicated = existing.some(
+    (archive) => archiveDedupKey(archive.elevatorId, archive.monthFrom, archive.monthTo)
+      === archiveDedupKey(input.elevatorId, input.monthFrom, input.monthTo),
+  );
+  if (duplicated) throw new Error('该电梯此结清月份区间已封存，同一封存只保留一份');
+
+  const stamp = nowDateTime();
+  const archiveNo = generateArchiveNo(input.monthFrom, await occupiedArchiveNos());
+  const archive: ArchiveRow = {
+    archiveNo,
+    elevatorId: input.elevatorId,
+    elevator,
+    monthFrom: input.monthFrom,
+    monthTo: input.monthTo,
+    plans: resolved.plans,
+    checkItems: resolved.checkItems,
+    rectifies: resolved.rectifies,
+    sealedAt: stamp,
+    note: input.note?.trim() ?? '',
+    createdAt: stamp,
+    revision: ROW_REVISION,
+  };
+
+  // add 以档案号为主键：两个标签页并发生成同号档案时只有一份写入成功
+  await db.archives.add(archive);
+  return archive;
+}
+
+/** 删除封存档案（仅删档案登记，不动现行台账） */
+export async function removeArchive(archiveNo: string): Promise<void> {
+  await db.archives.delete(archiveNo);
+}
+
+/* ====================== 档案包导出 / 逐层核对导入 ====================== */
+
+/** 导出档案包（不指定档案号时导出全部封存档案） */
+export async function exportArchivePackage(archiveNos?: string[]): Promise<ArchivePackage> {
+  const all = await listArchives();
+  const archives = archiveNos && archiveNos.length > 0
+    ? all.filter((archive) => archiveNos.includes(archive.archiveNo))
+    : all;
+  return {
+    kind: ARCHIVE_PACKAGE_KIND,
+    formatVersion: ARCHIVE_FORMAT_VERSION,
+    exportedAt: nowDateTime(),
+    archives,
+  };
+}
+
+/** 档案与现行台账逐层核对：返回冲突 / 缺项原因（空数组表示可以落库） */
+async function checkArchiveAgainstLedger(archive: ArchiveRow): Promise<string[]> {
+  const reasons = validateArchive(archive);
+
+  const existingSameNo = await db.archives.get(archive.archiveNo);
+  if (existingSameNo && !sameRow(existingSameNo, archive)) {
+    reasons.push(`档案号 ${archive.archiveNo} 已被另一份内容不同的档案占用（号段冲突）`);
+  }
+
+  // 业务行逐层比对：同 id 已存在但内容不一致即冲突；不存在则属于缺项，需要补写
+  const checkRows = async <T extends { id: string }>(
+    table: Table<T, string>,
+    rows: T[],
+    label: string,
+  ): Promise<void> => {
+    for (const row of rows) {
+      const current = await table.get(row.id);
+      if (current && !sameRow(current, row)) {
+        reasons.push(`${label} ${row.id} 已在现行台账中且内容被改动，拒绝覆盖`);
+      }
+    }
+  };
+
+  await checkRows(db.elevators, [archive.elevator], '电梯');
+  await checkRows(db.plans, archive.plans, '计划');
+  await checkRows(db.checkItems, archive.checkItems, '保养项');
+  await checkRows(db.rectifies, archive.rectifies, '整改单');
+
+  return reasons;
+}
+
+/** 单份档案落库：业务四表 + 档案登记同一事务，任一失败整体回滚，不写半份数据 */
+async function applyArchiveToLedger(archive: ArchiveRow): Promise<void> {
+  await db.transaction(
+    'rw',
+    [db.elevators, db.plans, db.checkItems, db.rectifies, db.archives],
+    async () => {
+      if (!(await db.elevators.get(archive.elevatorId))) {
+        await db.elevators.put(archive.elevator);
+      }
+      for (const plan of archive.plans) {
+        if (!(await db.plans.get(plan.id))) await db.plans.put(plan);
+      }
+      for (const item of archive.checkItems) {
+        if (!(await db.checkItems.get(item.id))) await db.checkItems.put(item);
+      }
+      for (const rectify of archive.rectifies) {
+        if (!(await db.rectifies.get(rectify.id))) await db.rectifies.put(rectify);
+      }
+      if (!(await db.archives.get(archive.archiveNo))) {
+        await db.archives.put(archive);
+      }
+    },
+  );
+}
+
+async function putStaging(archive: ArchiveRow, reasons: string[], sourceFile: string): Promise<PendingArchiveRow> {
+  const existing = await db.archiveStaging.where('archiveNo').equals(archive.archiveNo).first();
+  const row: PendingArchiveRow = {
+    id: existing?.id ?? `staging-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    archiveNo: archive.archiveNo,
+    elevatorId: archive.elevatorId,
+    payload: archive,
+    reasons,
+    sourceFile,
+    createdAt: existing?.createdAt ?? nowDateTime(),
+    revision: ROW_REVISION,
+  };
+  await db.archiveStaging.put(row);
+  return row;
+}
+
+/* ------------------------------ 导入任务 ------------------------------ */
+
+export interface ArchiveImportOutcome {
+  job: ArchiveImportJobRow;
+  /** 本次新落库的档案号 */
+  imported: string[];
+  /** 本次进入待处理区的档案号 */
+  staged: string[];
+}
+
+export async function listImportJobs(): Promise<ArchiveImportJobRow[]> {
+  const rows = await db.archiveImportJobs.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function removeImportJob(id: string): Promise<void> {
+  await db.archiveImportJobs.delete(id);
+}
+
+export async function listPendingArchives(): Promise<PendingArchiveRow[]> {
+  const rows = await db.archiveStaging.toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function removePendingArchive(id: string): Promise<void> {
+  await db.archiveStaging.delete(id);
+}
+
+async function persistJob(job: ArchiveImportJobRow, state: ArchiveImportJobRow['state']): Promise<void> {
+  job.state = state;
+  job.updatedAt = nowDateTime();
+  await db.archiveImportJobs.put(job);
+}
+
+/**
+ * 接收档案包：登记导入任务后逐份处理。
+ * 每份档案先逐层核对，通过则整份粘回台账（空库直接补、已有台账只补缺失行），
+ * 缺项 / 号段冲突进待处理区；系统异常时任务置 error 并保留进度，可重试。
+ */
+export async function importArchivePackage(pack: unknown, sourceFile: string): Promise<ArchiveImportOutcome> {
+  if (!isArchivePackage(pack)) {
+    throw new Error('文件格式不正确：不是封存档案包（缺少 kind=gbelevsvc-archive-package 标识）');
+  }
+  const archiveNos = pack.archives.map((archive) => archive.archiveNo);
+  const job: ArchiveImportJobRow = {
+    id: `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    package: pack,
+    importedNos: [],
+    stagedNos: [],
+    pendingNos: archiveNos,
+    state: 'running',
+    lastError: '',
+    sourceFile,
+    createdAt: nowDateTime(),
+    updatedAt: nowDateTime(),
+    revision: ROW_REVISION,
+  };
+  await db.archiveImportJobs.add(job);
+  return processArchiveImport(job.id);
+}
+
+/** 推进（或失败后重试）一个导入任务：从 pendingNos 中继续，已成功的不重复写入 */
+export async function processArchiveImport(jobId: string): Promise<ArchiveImportOutcome> {
+  const job = await db.archiveImportJobs.get(jobId);
+  if (!job) throw new Error('导入任务不存在');
+  const imported: string[] = [];
+  const staged: string[] = [];
+
+  while (job.pendingNos.length > 0) {
+    const archiveNo = job.pendingNos[0];
+    const archive = job.package.archives.find((item) => item.archiveNo === archiveNo);
+    if (!archive) {
+      // 包内容与进度不一致：记入待处理区而不是丢数据
+      await persistJob(job, 'error');
+      throw new Error(`档案号 ${archiveNo} 在档案包中找不到，导入中止`);
+    }
+    try {
+      const reasons = await checkArchiveAgainstLedger(archive);
+      if (reasons.length > 0) {
+        const row = await putStaging(archive, reasons, job.sourceFile);
+        if (!job.stagedNos.includes(row.archiveNo)) job.stagedNos.push(row.archiveNo);
+        staged.push(row.archiveNo);
+      } else {
+        await applyArchiveToLedger(archive);
+        if (!job.importedNos.includes(archive.archiveNo)) job.importedNos.push(archive.archiveNo);
+        imported.push(archive.archiveNo);
+      }
+      job.pendingNos = job.pendingNos.slice(1);
+      await persistJob(job, 'running');
+    } catch (cause) {
+      // 事务已回滚，不会写入半份数据；进度停在当前档案，保留现场等待重试
+      job.lastError = cause instanceof Error ? cause.message : '档案落库异常';
+      await persistJob(job, 'error');
+      return { job, imported, staged };
+    }
+  }
+
+  await persistJob(job, 'done');
+  return { job, imported, staged };
+}
+
+/**
+ * 待处理区单项重试：重新逐层核对，通过则整份落库并移出待处理区，
+ * 仍不通过则刷新原因留在待处理区。
+ */
+export async function retryPendingArchive(pendingId: string): Promise<{ ok: boolean; reasons: string[] }> {
+  const pending = await db.archiveStaging.get(pendingId);
+  if (!pending) throw new Error('待处理档案不存在');
+  const reasons = await checkArchiveAgainstLedger(pending.payload);
+  if (reasons.length > 0) {
+    await db.archiveStaging.put({ ...pending, reasons });
+    return { ok: false, reasons };
+  }
+  await db.transaction('rw', [db.archiveStaging, db.elevators, db.plans, db.checkItems, db.rectifies, db.archives], async () => {
+    await applyArchiveToLedger(pending.payload);
+    await db.archiveStaging.delete(pendingId);
+  });
+  // 同步收尾关联任务：把该档案号从 staged 调整到 imported
+  const jobs = await db.archiveImportJobs.where('state').anyOf(['done', 'error', 'running']).toArray();
+  for (const job of jobs) {
+    if (job.stagedNos.includes(pending.archiveNo)) {
+      job.stagedNos = job.stagedNos.filter((no) => no !== pending.archiveNo);
+      if (!job.importedNos.includes(pending.archiveNo)) job.importedNos.push(pending.archiveNo);
+      job.updatedAt = nowDateTime();
+      await db.archiveImportJobs.put(job);
+    }
+  }
+  return { ok: true, reasons: [] };
+}
+
 /* ========================== 整库导入导出 ========================== */
 
 export interface DatabaseSnapshot {
@@ -535,14 +913,18 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [elevators, plans, checkItems, rescues, rectifies] = await Promise.all([
-    db.elevators.count(),
-    db.plans.count(),
-    db.checkItems.count(),
-    db.rescues.count(),
-    db.rectifies.count(),
-  ]);
-  return { elevators, plans, checkItems, rescues, rectifies };
+  const [elevators, plans, checkItems, rescues, rectifies, archives, archiveStaging, archiveImportJobs] =
+    await Promise.all([
+      db.elevators.count(),
+      db.plans.count(),
+      db.checkItems.count(),
+      db.rescues.count(),
+      db.rectifies.count(),
+      db.archives.count(),
+      db.archiveStaging.count(),
+      db.archiveImportJobs.count(),
+    ]);
+  return { elevators, plans, checkItems, rescues, rectifies, archives, archiveStaging, archiveImportJobs };
 }
 
 /** 结构版本信息 */

@@ -26,6 +26,7 @@ import { usePlanStore } from './stores/planStore';
 import { useCheckStore } from './stores/checkStore';
 import { useRescueStore } from './stores/rescueStore';
 import { useRectifyStore } from './stores/rectifyStore';
+import { useArchiveStore } from './stores/archiveStore';
 import { formatAverageMinutes } from './utils/duration';
 
 const route = useRoute();
@@ -37,11 +38,18 @@ const planStore = usePlanStore();
 const checkStore = useCheckStore();
 const rescueStore = useRescueStore();
 const rectifyStore = useRectifyStore();
+const archiveStore = useArchiveStore();
 
 onMounted(async () => {
   try {
     await elevatorStore.bootstrap();
-    await Promise.all([planStore.bootstrap(), checkStore.bootstrap(), rescueStore.bootstrap(), rectifyStore.bootstrap()]);
+    await Promise.all([
+      planStore.bootstrap(),
+      checkStore.bootstrap(),
+      rescueStore.bootstrap(),
+      rectifyStore.bootstrap(),
+      archiveStore.bootstrap(),
+    ]);
   } catch (error) {
     message.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`);
   }
@@ -52,6 +60,7 @@ const selectedKey = computed(() => {
   if (route.path.startsWith('/plans')) return ROUTES.plans;
   if (route.path.startsWith('/rescues')) return ROUTES.rescues;
   if (route.path.startsWith('/rectifies')) return ROUTES.rectifies;
+  if (route.path.startsWith('/archives')) return ROUTES.archives;
   return ROUTES.elevators;
 });
 
@@ -65,6 +74,10 @@ const menuOptions = computed<MenuOption[]>(() => [
   {
     label: `年检整改与预警${rectifyStore.overdueViews.length > 0 ? `（超期 ${rectifyStore.overdueViews.length}）` : ''}`,
     key: ROUTES.rectifies,
+  },
+  {
+    label: `档案封存（${archiveStore.archiveViews.length}）${archiveStore.pending.length > 0 ? ` · 待处理 ${archiveStore.pending.length}` : ''}`,
+    key: ROUTES.archives,
   },
 ]);
 

@@ -1,6 +1,6 @@
 /**
  * 路由表（路径与项目提示词逐字一致）
- * /elevators、/plans、/plans/:id/items、/rescues、/rectifies
+ * /elevators、/plans、/plans/:id/items、/rescues、/rectifies、/archives
  * 全部页面按路由懒加载，构建时自动分包。
  */
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
@@ -12,6 +12,7 @@ export const ROUTES = {
   planItems: (planId: string): string => `/plans/${planId}/items`,
   rescues: '/rescues',
   rectifies: '/rectifies',
+  archives: '/archives',
 } as const;
 
 export const appRoutes: RouteRecordRaw[] = [
@@ -45,6 +46,12 @@ export const appRoutes: RouteRecordRaw[] = [
     name: 'rectifies',
     component: () => import('../pages/RectifyList.vue'),
     meta: { title: '年检整改与预警' },
+  },
+  {
+    path: ROUTES.archives,
+    name: 'archives',
+    component: () => import('../pages/ArchiveSeal.vue'),
+    meta: { title: '电梯档案封存' },
   },
   { path: '/:pathMatch(.*)*', redirect: ROUTES.elevators },
 ];
