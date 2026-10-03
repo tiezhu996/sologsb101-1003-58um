@@ -12,6 +12,7 @@ export const ROUTES = {
   planItems: (planId: string): string => `/plans/${planId}/items`,
   rescues: '/rescues',
   rectifies: '/rectifies',
+  archives: '/archives',
 } as const;
 
 export const appRoutes: RouteRecordRaw[] = [
@@ -45,6 +46,12 @@ export const appRoutes: RouteRecordRaw[] = [
     name: 'rectifies',
     component: () => import('../pages/RectifyList.vue'),
     meta: { title: '年检整改与预警' },
+  },
+  {
+    path: ROUTES.archives,
+    name: 'archives',
+    component: () => import('../pages/ArchiveSeal.vue'),
+    meta: { title: '电梯档案封存' },
   },
   { path: '/:pathMatch(.*)*', redirect: ROUTES.elevators },
 ];

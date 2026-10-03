@@ -8,6 +8,7 @@
     "dev": "vite --host --port 22803",
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
+    "verify:archive": "esbuild scripts/verify-archive.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/verify-archive.mjs --log-level=warning && node node_modules/.cache/verify-archive.mjs",
     "preview": "vite preview --host --port 22803"
   },
   "dependencies": {
@@ -20,6 +21,7 @@
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@vitejs/plugin-vue": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^5.4.11",
     "vue-tsc": "^2.2.0"

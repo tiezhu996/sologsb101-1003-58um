@@ -5,6 +5,7 @@
  * 消费 Rectify、Elevator 与 <StateTag>、<EmptyPanel>。
  */
 import { computed, h, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   NButton,
   NCard,
@@ -52,12 +53,14 @@ import {
 import { backupFilename, downloadCsv, downloadJson, readJsonFile } from '../utils/export';
 import { todayDate } from '../utils/duration';
 import { useIdbTable } from '../hooks/useIdbTable';
+import { ROUTES } from '../router';
 import StateTag from '../components/common/StateTag.vue';
 import StatBadge from '../components/common/StatBadge.vue';
 import EmptyPanel from '../components/common/EmptyPanel.vue';
 import FilterBar from '../components/common/FilterBar.vue';
 
 const message = useMessage();
+const router = useRouter();
 const rectifyStore = useRectifyStore();
 const elevatorStore = useElevatorStore();
 
@@ -274,6 +277,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
       </div>
       <n-space>
         <n-button @click="exportOverdueCsv">导出整改 CSV</n-button>
+        <n-button @click="router.push(ROUTES.archives)">档案封存</n-button>
         <n-button @click="handleExport">导出 JSON</n-button>
         <n-upload
           :show-file-list="false"

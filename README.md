@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 逐项填写实测值与结果（正常 / 异常 / 建议）并签署，签署时校验未填项
 - 异常项一键转年检整改单，复核通过后关闭
 - 录入困人救援的报警 / 到场 / 救出时间，自动计算到场与救援时长并按 30 分钟到场要求判定
+- 按电梯 + 结清月份封存已签署保养计划、对应保养项及异常项转出的整改单为独立档案；档案包逐层核对粘回，缺项 / 号段冲突进待处理区可重试
 - 整库 JSON 导出 / 导入与 IndexedDB 结构版本查看
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -54,6 +55,7 @@ docker compose up -d --build # 代码改动后重建
 | `/plans/:id/items` | 保养执行 | 逐项填写实测值与结果并签署，异常转整改 |
 | `/rescues` | 困人救援时间线 | 录入报警 / 到场 / 救出时间并自动算时长 |
 | `/rectifies` | 年检整改与预警 | 整改单跟踪、超期预警与版本 / JSON 管理 |
+| `/archives` | 电梯档案封存 | 按电梯 + 结清月份封存独立档案，档案包导入核对 / 待处理区重试 |
 
 > 路由使用 history 模式（`createWebHistory`），与 nginx 的 `try_files $uri $uri/ /index.html` 配合，直接访问上述深链接（含刷新）都能命中对应页面。
 
@@ -78,19 +80,19 @@ sologsb101-1003/
         ├── AppLayout.vue        # 应用外壳（侧边导航 + 当前电梯上下文）
         ├── env.d.ts
         ├── styles/main.css
-        ├── types/               # elevator.ts plan.ts checkItem.ts rescue.ts rectify.ts persistence.ts
-        ├── stores/              # elevatorStore.ts planStore.ts checkStore.ts rescueStore.ts rectifyStore.ts
+        ├── types/               # elevator.ts plan.ts checkItem.ts rescue.ts rectify.ts archive.ts persistence.ts
+        ├── stores/              # elevatorStore.ts planStore.ts checkStore.ts rescueStore.ts rectifyStore.ts archiveStore.ts
         ├── components/common/   # StateTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/               # usePlanProgress.ts useIdbTable.ts
-        ├── pages/               # ElevatorList.vue PlanList.vue PlanExecute.vue RescueTimeline.vue RectifyList.vue
+        ├── pages/               # ElevatorList.vue PlanList.vue PlanExecute.vue RescueTimeline.vue RectifyList.vue ArchiveSeal.vue
         ├── router/index.ts
-        └── utils/               # duration.ts cycle.ts db.ts export.ts events.ts
+        └── utils/               # duration.ts cycle.ts db.ts export.ts archive.ts events.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbelevsvc`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的 `upgrade` 迁移（v3 迁移逐表补齐行修订号，旧数据先迁移再启用档案功能）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -100,7 +102,12 @@ sologsb101-1003/
   | `checkItems` | 保养项 | id / planId / seq / result / itemName / [planId+seq] |
   | `rescues` | 困人事件 | id / elevatorId / alarmAt / responder |
   | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer |
+  | `archives` | 封存档案（含计划/保养项/整改单快照副本） | id（档案号）/ elevatorId / settleMonth / [elevatorId+settleMonth] |
+  | `archiveStaging` | 档案导入待处理区 | id / archiveNo / elevatorId / settleMonth / state |
   | `settings` | 自定义字典 | id |
+
+- **封存规则**：仅已签署计划可封存，按签署月份结清；封存只向 `archives` 追加副本，现行台账五张表原样保留（在执行计划与后续救援不被锁死）。档案号按「电梯 + 月份」确定性生成，两个标签页同时封存同一电梯同一月份只保留一份。
+- **档案包导入**：粘回空库或已有台账时逐层核对（结构缺项、计划→电梯 / 保养项→计划 / 整改单→电梯的悬挂引用、实体 ID 号段冲突、档案号重复）；任一层不过先放入 `archiveStaging` 待处理区，保留问题清单、进度与重试次数；单份档案单事务落库，失败整体回滚，不写入半份数据。
 
 - **首屏自动播种**：`initDatabase()` 在 `elevators` 表为空时写入演示数据（幂等）——3 台电梯 × 各 2~4 期计划 × 每期 5~10 个保养项（含异常 / 建议项）+ 3 起困人事件 + 5 条整改单，父子记录通过 `elevatorId / planId` 互相引用。
 - **跨页状态**：全部放在 Pinia store（`elevatorStore / planStore / checkStore / rescueStore / rectifyStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
@@ -113,6 +120,7 @@ cd frontend
 npm install
 npm run dev        # http://localhost:22803
 npm run typecheck  # vue-tsc --noEmit
+npm run verify:archive  # fake-indexeddb 端到端核对封存/导入/待处理区重试
 npm run build      # vue-tsc --noEmit && vite build
 npm run preview    # 预览构建产物
 ```
